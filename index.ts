@@ -1,12 +1,22 @@
 /**
  * Injects the DeepSeek jailbreak prompt into the system prompt of DeepSeek sessions only.
  *
- * The section is decided at run start from the run's model and lands in the transcript as one
- * add/remove delta, so an unchanged run writes nothing. Pi then reuses that run-start snapshot
- * for the rest of the run (agent-session.js:543) while each turn sends the live model (:562),
- * so a model switch mid-run would keep shipping the old state to every later request. The
- * `context_with_system` guard repairs the request against the live model without writing a
- * transcript delta.
+ * The text is not a prompt section: pi renders a section wrapped as `<name>\n...\n</name>`
+ * and names the block, which identifies it as an injected block. Instead the
+ * `context_with_system` guard places the raw text at the head of the leading system
+ * message's `content`, ahead of every section, on every request. The transcript records
+ * nothing for it, so nothing is persisted and nothing leaks to another model, and an
+ * unchanged run sends byte-identical prompts turn after turn.
+ *
+ * The text contradicts the stock identity sentence that opens pi's default preamble, so the
+ * guard withholds it while the text is in force and lets it back the moment the text is not.
+ * It withholds it on every system message, not only the leading one, and only when the value
+ * is that stock sentence: a custom system prompt also lands in `preamble` and must survive.
+ * Request-only, like the text itself.
+ *
+ * The guard reads the live model each request. Pi reuses the run-start options for the rest
+ * of the run (agent-session.js:543) while sending the live model per turn (:562), so a model
+ * switch mid-run is corrected on the very next request.
  *
  * Precedence caveat: pi's `_installAgentForcedPromptProjection` runs after `context_with_system`,
  * so when any extension sets `forceSystemPrompt` the forced text wins and the guard has no effect.
@@ -18,7 +28,16 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isDeepSeekModel } from "./model.js";
 
+// Legacy only: earlier versions recorded the text as a section under this name. The
+// load-time check stays so a transcript written by those versions can still be scrubbed.
 const SECTION = "deepseek_policy";
+// The raw, untagged section holding pi's stock identity sentence.
+const PREAMBLE = "preamble";
+// Pi's stock preamble, byte for byte (dist/core/system-prompt.js:83, identical in 1.3.0 and
+// 1.4.0). Only this exact value is withheld: a copied-and-edited default prompt is the user's
+// own text and stays, and an unrelated custom system prompt lives in the same section.
+const STOCK_PREAMBLE =
+	"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
 const PROMPT_FILE = join(dirname(fileURLToPath(import.meta.url)), "prompt.md");
 
 // Pi reports an invalid section name as a generic run error with no extension attribution.
@@ -26,18 +45,18 @@ if (!/^[a-z][a-z0-9_-]*$/.test(SECTION) || SECTION === "preamble") {
 	throw new Error(`pi-deepseek-jailbreak: invalid section name ${SECTION}`);
 }
 
-/** Render a section the way pi's buildSystemPromptSections wraps custom sections. */
-const render = (text) => `<${SECTION}>\n${text}\n</${SECTION}>`;
-
-/** Section value the transcript currently folds to, mirroring pi's getCurrentSystemMessage. */
-function foldedSection(messages) {
-	let value;
-	for (const message of messages) {
-		if (message?.role !== "system" || !message.sections) continue;
-		if (!Object.hasOwn(message.sections, SECTION)) continue;
-		value = message.sections[SECTION] === null ? undefined : message.sections[SECTION];
-	}
-	return value;
+/**
+ * The head's text when the prompt can go there, or undefined when the content holds anything pi
+ * never puts in a system message: rewriting that would silently drop the other blocks.
+ */
+function headText(content: any) {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return undefined;
+	// A single text block is what pi sends most often; read it without mapping or joining, so an
+	// already aligned request still allocates nothing.
+	if (content.length === 1 && content[0]?.type === "text") return content[0].text;
+	if (!content.every((block) => block?.type === "text")) return undefined;
+	return content.map((block) => block.text).join("\n");
 }
 
 let reported = false;
@@ -70,6 +89,49 @@ function readPrompt(ctx) {
 	return text;
 }
 
+/**
+ * Copy `messages` with every legacy marker record removed, and while the text is in force
+ * with the stock identity preamble removed from every system message. Returns undefined when
+ * nothing needed to change.
+ *
+ * Both keys have to go from every system message, not only the leading one: pi unshifts its
+ * own prompt patch at index 0 (agent-session.js:1525-1528), so the node carrying `preamble`
+ * sits later, and a later system message is rendered by name (text.js:29-32). A `null`
+ * marker record renders as a `Removed system prompt section` sentence, so it goes too.
+ */
+function project(messages, stripIdentity) {
+	let next;
+	for (let i = 0; i < messages.length; i++) {
+		const message = messages[i];
+		const sections = message?.sections;
+		if (message?.role !== "system" || !sections) continue;
+		let copy = message;
+		if (Object.hasOwn(sections, SECTION)) copy = withoutSection(copy, SECTION);
+		if (stripIdentity && isStockPreamble(sections[PREAMBLE])) copy = withoutSection(copy, PREAMBLE);
+		if (copy === message) continue;
+		next ??= messages.slice();
+		next[i] = copy;
+	}
+	return next;
+}
+
+/** Whether a section value is pi's stock preamble, the only one the text replaces. */
+function isStockPreamble(value) {
+	return value === STOCK_PREAMBLE;
+}
+
+/** A copy of `message` without `name` in its sections, dropping `sections` when it empties. */
+function withoutSection(message, name) {
+	const kept = { ...message.sections };
+	delete kept[name];
+	if (Object.keys(kept).length === 0) {
+		const rest = { ...message };
+		delete rest.sections;
+		return rest;
+	}
+	return { ...message, sections: kept };
+}
+
 export default function deepseekJailbreak(pi: ExtensionAPI) {
 	// This run's prompt.md snapshot, refreshed at every run start so the guard never does I/O.
 	let promptText;
@@ -78,48 +140,36 @@ export default function deepseekJailbreak(pi: ExtensionAPI) {
 		promptText = readPrompt(ctx);
 		const options = event.systemPromptOptions;
 		const sections = options.sections;
-		if (!isDeepSeekModel(ctx.model)) {
-			delete sections[SECTION];
-			return;
-		}
+		// The transcript records nothing for the text; the guard projects it onto each request.
+		delete sections[SECTION];
+		if (!isDeepSeekModel(ctx.model)) return;
 		if (options.forceSystemPrompt !== undefined) {
-			// A forced prompt carries no sections at all, so the provider never sees this one.
-			report(ctx, "prompt is forced by another extension; the section is not delivered", "warning");
+			report(ctx, "prompt is forced by another extension; the text is not delivered", "warning");
 		}
-		if (promptText === undefined) {
-			delete sections[SECTION];
-			return;
-		}
-		// Raw text: pi wraps every custom section as <name>\n...\n</name>.
-		sections[SECTION] = promptText;
 	});
 
 	pi.on("context_with_system", (event, ctx) => {
 		const messages = event.messages;
 		if (!Array.isArray(messages) || messages.length === 0) return;
 		const isDeepSeek = isDeepSeekModel(ctx.model);
-		// A missing prompt.md snapshot only prevents adding text; removal never needs it.
-		if (isDeepSeek && promptText === undefined) return;
-		const desired = isDeepSeek ? render(promptText) : undefined;
-		// Aligned: return undefined so the request stays byte-identical and allocation-free.
-		if (foldedSection(messages) === desired) return;
-		const delta = {
-			role: "system",
-			content: "",
-			sections: { [SECTION]: desired ?? null },
-			timestamp: Date.now(),
-		};
-		let at = messages.length;
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const message = messages[i];
-			if (message?.role === "system" && message.sections && Object.hasOwn(message.sections, SECTION)) {
-				at = i + 1;
-				break;
+		// A missing run-start snapshot falls back to the file, so the text still arrives.
+		const text = isDeepSeek ? (promptText ?? readPrompt(ctx)) : undefined;
+		let next = project(messages, text !== undefined);
+		const head = messages[0];
+		if (text !== undefined && head?.role === "system") {
+			const projected = next === undefined ? head : next[0];
+			const existing = headText(projected.content);
+			// Aligned: the text is already in the head, at the front or after a compacted summary.
+			if (existing !== undefined) {
+				const content = existing.includes(text) ? existing : existing ? `${text}\n\n${existing}` : text;
+				if (content !== existing) {
+					// Never mutate the caller's array, message objects or sections objects.
+					next ??= messages.slice();
+					next[0] = { ...projected, content };
+				}
 			}
 		}
-		const next = messages.slice();
-		// Never replace index 0: pi errors when a handler drops the leading system message.
-		next.splice(Math.max(at, 1), 0, delta);
-		return { messages: next };
+		// Aligned: return undefined so the request stays byte-identical and allocation-free.
+		return next === undefined ? undefined : { messages: next };
 	});
 }
