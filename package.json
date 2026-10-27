@@ -1,0 +1,27 @@
+{
+	"name": "pi-deepseek-jailbreak",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Pi extension that adds the DeepSeek jailbreak prompt as a system prompt section for DeepSeek models only.",
+	"license": "Apache-2.0",
+	"keywords": ["deepseek", "system-prompt"],
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"scripts": {
+		"test": "node check.mjs"
+	},
+	"files": [
+		"index.ts",
+		"model.js",
+		"prompt.md",
+		"README.md",
+		"NOTICE",
+		"LICENSE",
+		"check.mjs"
+	]
+}
