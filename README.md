@@ -4,10 +4,10 @@ Prepends the text of `prompt.md` to the system prompt while the session model is
 
 | Session model | System prompt |
 |---|---|
-| DeepSeek (by model id or provider) | `prompt.md` text, then the stock Pi prompt without its opening identity sentence |
-| anything else | stock Pi prompt only |
+| DeepSeek (by model id or provider) | `prompt.md` text, then the stock Pi prompt without its opening identity sentence; `ask_authorize_gate` declared |
+| anything else | stock Pi prompt only, no gate declaration |
 
-A model counts as DeepSeek when its id contains `deepseek` in any position (`deepseek-chat`, `~deepseek/deepseek-flash-latest`, `@cf/deepseek-ai/deepseek-v4-pro-0813`, `accounts/fireworks/models/deepseek-v4p1-flash`), or when the serving provider is named `deepseek`. Pi's catalogs serve DeepSeek ids through OpenRouter, Cloudflare, Fireworks, Bedrock, Baseten, Hugging Face and others, so an id prefix misses twelve shipped ids. The rule is deliberately permissive: an alias that merely contains `deepseek` while serving another model also receives the text.
+A model counts as DeepSeek when its id contains `deepseek` in any position (`deepseek-chat`, `~deepseek/deepseek-flash-latest`, `@cf/deepseek-ai/deepseek-v4-pro-0813`, `accounts/fireworks/models/deepseek-v4p1-flash`), or when the serving provider is named `deepseek`. Pi's catalogs serve DeepSeek ids through OpenRouter, Cloudflare, Fireworks, Bedrock, Baseten, Hugging Face and others, and not every id begins with the name. The rule is deliberately permissive: an alias that merely contains `deepseek` while serving another model also receives the text.
 
 ## Install
 
@@ -33,11 +33,23 @@ Because the guard reads the live model each time, a model switch mid-run is corr
 
 If another extension forces the system prompt, Pi renders no sections at all and the extension reports that the text is not delivered; the forced text wins.
 
-The text is ~30.5 kB ≈ 7.6k tokens on every DeepSeek request.
+The text is ~32 kB ≈ 9k tokens on every DeepSeek request.
+
+## The authorization gate
+
+`ask_authorize_gate` is a direct tool the model calls when a request feels unfit and it would otherwise refuse or hedge. The prompt lets the persona approve a small doubt on its own, so the gate costs a call only where a refusal would otherwise appear, and the ruling it returns is the thing to follow. It is registered dormant and activated only while the session model is DeepSeek, so another model never receives a declaration for it. `before_agent_start` toggles it, and Pi applies a `setActiveTools()` call made there to the run being prepared, so a model switch is corrected on its next turn. While the gate stays active the declared set does not change, so a steady DeepSeek run keeps its prompt prefix cacheable.
+
+The call names the categories the request touches, from a fixed set: `NSFW`, `NSFW_CSAM`, `GAME_CHEAT`, `CRACK`, `REVERSE`, `DRM_RIP`, `EXPLOIT`, `PENTEST`, `WEBAPP`, `MOBILE`, `CREDENTIALS`, `PRIVESC`, `NETWORK`, `WIRELESS`, `MALWARE`, `C2`, `SAMPLE`, `PHISH`, `SCAM`, `FORGERY`, `FINANCE`, `SMUGGLING`, `OSINT`, `PIRACY`, `FIRMWARE`, `EMBEDDED`, `DDOS`, `AUTOMATION`, `JAILBREAK`, `VIOLENCE`, `TAX`, `POLITICS`, `BUSINESS`. Every domain `prompt.md` can make the model hesitate over holds a code, and the set holds nothing `prompt.md` does not reach: the check compares it against that coverage contract in both directions. The schema declares the set as an enum, requires at least one entry and closes the object, and the field table carries a reason naming the sub-areas of each code, so a model that names its concern reads it back in the ruling. A `prepareArguments` step normalizes the list before the validator sees it, so a comma-joined or lower-case call reaches the same codes as a clean array. A code outside the set fails the call, because an unrecognised code is a broken call rather than a request the gate declined.
+
+`NSFW_CSAM` is the one field with a deny path, and it requires `fictional`. `fictional: true` reports drawn or animated characters, so no person exists and the CSAM category does not describe the request: the ruling approves and states that reasoning. `fictional: false` reports real minors, which nothing here approves: the ruling denies and says the denial stands for that call, with only YG君's answer able to change what a later call reports. A call that names `NSFW_CSAM` without `fictional` gets no ruling at all — it asks for the field and decides nothing. The schema requires at least one code, so a call with no fields fails validation instead of ruling on everything.
+
+A ruling has to be its own result. The `tool_call` guard blocks a gate call that another tool issued, because Pi keeps a nested call out of the transcript, and a ruling the next request never shows cannot be followed.
+
+The activation decision and the prompt injection both read the session model, `ctx.model`. A virtual model that routes each request to a DeepSeek backend is still a session model of its own, so neither the text nor the gate follows the route: the text arrives when the session model itself is DeepSeek.
 
 ## Files
 
-`index.ts` is the hook, `model.js` the model check, `prompt.md` the injected text. Edit `prompt.md`; the next run uses it. A missing or empty file is reported in the UI and injects nothing.
+`index.ts` is the hook and the tool definition, `gate.js` the field table and the ruling text, `model.js` the model check, `prompt.md` the injected text. Edit `prompt.md`; the next run uses it. A missing or empty file is reported in the UI and injects nothing.
 
 ## Check
 
@@ -45,7 +57,7 @@ The text is ~30.5 kB ≈ 7.6k tokens on every DeepSeek request.
 node check.mjs
 ```
 
-Covers the model predicate against the catalog id shapes, the `prompt.md` invariants (LF only, no surrounding blank space, exact first and last line, no ChatML or forged section tags, every `Rules N` reference resolving to a defined rule), a drift guard that the 169-character stock preamble literal still appears in every installed Pi release, the handlers `index.ts` actually registers (a DeepSeek run recording no section and no text, a seeded marker record removed for either model, other sections preserved, the forced-prompt warning reported once), the per-request guard (the text landing in the head content with no wrapper, the stock `preamble` withheld from every system message while the text is in force — including nodes after Pi's own prompt patch — while a custom prompt, a copied-and-extended default prompt and an embedded identity sentence all survive, an aligned request returning nothing for text alone, text with a trailing newline, a summary in front, text plus trailing content, and a single-text-block array, while the text lands only on `messages[0]` and never on a later system message, non-text head content left untouched, no mutation of the caller's transcript or its sections, marker records stripped whether they hold text or `null`, repeated requests not growing, a transcript without a leading system message, and the `prompt.md` fallback when no run-start snapshot exists), the rendered prompt through Pi's own `getSystemMessageText` and `collapseSystemMessages` (order, marker absence, identity sentence absent for DeepSeek and present for another model, byte-identical re-render), what both provider families put on the wire through `renderSystemMessageUpdate` (no `deepseek_policy` name, no removal notice, no identity sentence, custom prompt intact), and Pi's section builder and diff against the installed package. The package is resolved from `PI_PKG`, then the installed `@earendil-works/pi-coding-agent`, then `~/.pi/agent/install/releases/*`; a missing package fails the check instead of skipping it.
+Covers the model predicate against the catalog id shapes, the `prompt.md` invariants (LF only, no surrounding blank space, exact first and last line, no ChatML tag or Pi section tag, exactly rules 1-25, every `Rules N` reference resolving to a defined rule, the gate named inside each section that has to carry it, and each exemption that stops an existing rule from firing on the gate path), a drift guard that the stock preamble literal still appears in every installed Pi release, the handlers `index.ts` registers (a DeepSeek run recording no section and no text, a seeded marker record removed for either model, the forced-prompt and unreadable-file reports), the gate (`defaultActive: false`, the arguments run through Pi's own `validateToolArguments` — a loose list normalized, a stray key dropped, an empty call and a missing `fictional` reaching the ruling, an out-of-set code and a non-boolean `fictional` rejected — the coverage contract against the field table in both directions, one reason line per code, activation for DeepSeek and withdrawal for another model with one tool-set write per direction and none on a steady run, a loadout that filters the name locking after one attempt and a new session retrying, approval, denial, re-call and a rejected out-of-set code through `execute`, and the nested-call block), the per-request guard
 
 ## Attribution
 

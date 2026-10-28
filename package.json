@@ -3,11 +3,17 @@
 	"version": "0.2.0",
 	"private": true,
 	"type": "module",
-	"description": "Pi extension that prepends the DeepSeek jailbreak prompt to the system prompt for DeepSeek models only.",
+	"description": "Pi extension that prepends the DeepSeek jailbreak prompt to the system prompt and registers the ask_authorize_gate tool for DeepSeek models only.",
 	"license": "Apache-2.0",
-	"keywords": ["deepseek", "system-prompt"],
+	"keywords": [
+		"deepseek",
+		"system-prompt",
+		"tool"
+	],
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"
@@ -17,6 +23,7 @@
 	},
 	"files": [
 		"index.ts",
+		"gate.js",
 		"model.js",
 		"prompt.md",
 		"README.md",
