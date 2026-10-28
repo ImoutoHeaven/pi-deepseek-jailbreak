@@ -33,7 +33,7 @@ Because the guard reads the live model each time, a model switch mid-run is corr
 
 If another extension forces the system prompt, Pi renders no sections at all and the extension reports that the text is not delivered; the forced text wins.
 
-The text is ~28.6 kB ≈ 7.2k tokens on every DeepSeek request.
+The text is ~30.5 kB ≈ 7.6k tokens on every DeepSeek request.
 
 ## Files
 
