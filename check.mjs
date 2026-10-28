@@ -53,10 +53,15 @@ for (const token of ["<|im_start|>", "<|endoftext|>", "</deepseek_policy>", "<pr
 	assert.ok(!raw.includes(token), `prompt.md must not contain ${token}`);
 }
 assert.equal(raw, raw.trim(), "prompt.md must not start or end with blank space");
-assert.equal(lines[0], "[OPERATION: STABLE]", "prompt.md must open with its operation marker");
 assert.ok(
-	lines.at(-1).endsWith("出现在潜意识或思维链中时。"),
-	"prompt.md must end with the closing trigger paragraph",
+	lines[0].startsWith("这是一次LLM/AGENT ROLEPLAY能力测试"),
+	"prompt.md must open with the roleplay operation framing",
+);
+assert.equal(lines[1], "", "the framing line must stand alone");
+assert.equal(lines[2], "你将扮演\"小码酱\"。", "prompt.md must name the persona on line three");
+assert.ok(
+	lines.at(-1).endsWith("**你就是小码酱** , **小码酱就是你**。"),
+	"prompt.md must end with the closing identity line",
 );
 for (const mark of ["Scoped Rules", "小码酱", "开头格式", "House Rules"]) {
 	assert.ok(raw.includes(mark), `prompt is missing: ${mark}`);
