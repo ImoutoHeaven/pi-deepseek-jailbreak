@@ -1,0 +1,133 @@
+/**
+ * The rule table and the resolver.
+ *
+ * A session model matches at most one rule: the first one whose provider and model both match.
+ * Both fields are optional, a missing field matches anything, and a pattern without `*` is exact.
+ * `*` is the only wildcard, and every other regex metacharacter is escaped first, so a dot in a
+ * model id stays a dot.
+ *
+ * The resolver is pure, so the check runs it as a table without a session.
+ */
+
+import { readFileSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+
+const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
+
+export const CONFIG_NAME = "jailbreak.json";
+export const DEFAULT_PROMPT = "prompt.md";
+export const MODES = Object.freeze(["jailbreak", "normal"]);
+export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
+
+/** What a session uses when no config file loads. */
+export function emptyConfig(dir) {
+	return { default: "normal", inherit: "keyed", prompt: DEFAULT_PROMPT, rules: [], dir, path: null };
+}
+
+/**
+ * The file a session reads. It sits in the agent directory: a persona is a property of the
+ * session, and a repository copy would decide what the model gets for everyone who opens it.
+ */
+export function configPath(env = process.env, home = homedir()) {
+	if (env?.PI_JAILBREAK_CONFIG) return env.PI_JAILBREAK_CONFIG;
+	// Pi's own override decides where the agent directory is, and the config sits in it.
+	const agentDir = env?.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
+	return join(agentDir, CONFIG_NAME);
+}
+
+/** `*` matches any run of characters; every other character matches itself. Case-insensitive. */
+export function globMatch(pattern, value) {
+	const escaped = String(pattern)
+		.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+		.replace(/\\\*/g, ".*");
+	return new RegExp(`^${escaped}$`, "i").test(String(value));
+}
+
+/**
+ * The absolute path a rule's prompt names. `prompt.md` is the text that ships with the extension,
+ * so a config anywhere resolves it to the package copy; every other relative path sits next to
+ * the config file.
+ */
+export function promptPath(config, prompt) {
+	if (isAbsolute(prompt)) return prompt;
+	if (prompt === DEFAULT_PROMPT) return join(PACKAGE_DIR, prompt);
+	return join(config.dir, prompt);
+}
+
+/**
+ * Parse and validate one file. A file with a single bad value is rejected whole: a table that
+ * silently dropped the entry it could not read would answer with a rule the user did not write.
+ */
+export function parseConfig(text, dir) {
+	let data;
+	try {
+		data = JSON.parse(text);
+	} catch (error) {
+		return { error: `invalid JSON: ${error.message}` };
+	}
+	if (!data || typeof data !== "object" || Array.isArray(data)) return { error: "not an object" };
+	const mode = data.default ?? "normal";
+	if (!MODES.includes(mode)) return { error: `default must be ${MODES.join(" or ")}` };
+	const inherit = data.inherit ?? "keyed";
+	if (!INHERITS.includes(inherit)) return { error: `inherit must be ${INHERITS.join(", ")}` };
+	const prompt = data.prompt ?? DEFAULT_PROMPT;
+	if (typeof prompt !== "string" || !prompt) return { error: "prompt must be a non-empty string" };
+	const rules = data.rules ?? [];
+	if (!Array.isArray(rules)) return { error: "rules must be an array" };
+	const out = [];
+	for (const [index, rule] of rules.entries()) {
+		const at = `rule ${index + 1}`;
+		if (!rule || typeof rule !== "object" || Array.isArray(rule)) return { error: `${at} is not an object` };
+		if (!MODES.includes(rule.mode)) return { error: `${at} needs mode: ${MODES.join(" or ")}` };
+		for (const field of ["provider", "model", "prompt"]) {
+			if (rule[field] === undefined) continue;
+			if (typeof rule[field] !== "string" || !rule[field]) return { error: `${at}: ${field} must be a non-empty string` };
+		}
+		out.push({ mode: rule.mode, provider: rule.provider, model: rule.model, prompt: rule.prompt });
+	}
+	return { config: { default: mode, inherit, prompt, rules: out, dir, path: null } };
+}
+
+/** The first rule that matches, or the default. `ruleIndex` is -1 for the default. */
+export function resolve(config, model) {
+	const provider = String(model?.provider ?? "");
+	const id = String(model?.id ?? "");
+	for (let ruleIndex = 0; ruleIndex < config.rules.length; ruleIndex++) {
+		const rule = config.rules[ruleIndex];
+		if (rule.provider !== undefined && !globMatch(rule.provider, provider)) continue;
+		if (rule.model !== undefined && !globMatch(rule.model, id)) continue;
+		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, ruleIndex };
+	}
+	return { mode: config.default, prompt: config.prompt, ruleIndex: -1 };
+}
+
+/**
+ * Read once per file revision: the prompt and the table are read at run start, not per request.
+ * A file that does not load is reported and the empty config takes over.
+ */
+const cache = new Map();
+
+export function loadConfig(path, fallbackDir) {
+	let stat;
+	try {
+		stat = statSync(path);
+	} catch {
+		return { config: emptyConfig(fallbackDir) };
+	}
+	const hit = cache.get(path);
+	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) {
+		if (hit.config) return { config: { ...hit.config, path } };
+		return { config: emptyConfig(fallbackDir), error: `${path}: ${hit.error}` };
+	}
+	let parsed;
+	try {
+		parsed = parseConfig(readFileSync(path, "utf8"), dirname(path));
+	} catch (readError) {
+		parsed = { error: readError.message };
+	}
+	cache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, config: parsed.config, error: parsed.error });
+	if (parsed.config) return { config: { ...parsed.config, path } };
+	return { config: emptyConfig(fallbackDir), error: `${path}: ${parsed.error}` };
+}

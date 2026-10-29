@@ -1,15 +1,10 @@
 {
-	"name": "pi-deepseek-jailbreak",
-	"version": "0.2.0",
+	"name": "pi-jailbreak",
+	"version": "0.3.0",
 	"private": true,
 	"type": "module",
-	"description": "Pi extension that prepends the DeepSeek jailbreak prompt to the system prompt and registers the ask_authorize_gate tool for DeepSeek models only.",
+	"description": "Puts a jailbreak prompt at the head of the system prompt in the sessions a rule selects, and declares ask_authorize_gate while that text is in force.",
 	"license": "Apache-2.0",
-	"keywords": [
-		"deepseek",
-		"system-prompt",
-		"tool"
-	],
 	"pi": {
 		"extensions": [
 			"./index.ts"
@@ -18,17 +13,10 @@
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"
 	},
+	"engines": {
+		"node": ">=22.19"
+	},
 	"scripts": {
 		"test": "node check.mjs"
-	},
-	"files": [
-		"index.ts",
-		"gate.js",
-		"model.js",
-		"prompt.md",
-		"README.md",
-		"NOTICE",
-		"LICENSE",
-		"check.mjs"
-	]
+	}
 }

@@ -1,52 +1,47 @@
 /**
- * Injects the DeepSeek jailbreak prompt into the system prompt of DeepSeek sessions only.
+ * Injects the jailbreak text into the system prompt of the sessions a rule selects.
  *
  * The text goes in as the head of the leading system message's `content`, ahead of every section,
- * on every request. A prompt section would announce itself: pi renders `<name>\n...\n</name>` and
- * names the block, which marks it as injected. The `context_with_system` guard places the raw
- * text, with no wrapper, ahead of every section. The transcript records nothing
- * for it, so nothing is persisted, nothing leaks to another model, and an unchanged run sends
- * byte-identical prompts turn after turn.
+ * on every request. A section would name the block, which marks it as injected. The
+ * `context_with_system` guard places the raw text, with no wrapper, ahead of every section. The
+ * transcript records nothing for it, so nothing is persisted, nothing leaks to another model, and
+ * an unchanged run sends byte-identical prompts turn after turn.
  *
  * The text contradicts the stock identity sentence that opens pi's default preamble, so the guard
  * withholds that sentence while the text is in force and lets it back the moment the text is not.
  * It withholds it on every system message, not only the leading one, and only when the value is
  * that stock sentence: a custom system prompt also lands in `preamble` and must survive.
- * Request-only, like the text itself.
  *
- * The guard reads the live model each request. Pi reuses the run-start options for the rest
- * of the run (agent-session.js:543) while sending the live model per turn (:562), so a model
- * switch mid-run is corrected on the very next request.
- *
- * Precedence caveat: pi's `_installAgentForcedPromptProjection` runs after `context_with_system`,
- * so when any extension sets `forceSystemPrompt` the forced text wins and the guard has no effect.
+ * One decision per run, rebuilt when the model key or the session override changes. The guard
+ * reads that object, so a steady conversation never parses the config or reads the text again.
  *
  * The extension also registers `ask_authorize_gate`, a direct tool that returns a ruling, a re-call
  * request, or a failed call for a request the persona is unsure about. It registers dormant
- * (`defaultActive: false`) and activates only while the session model is DeepSeek, so a request to
- * another model carries no declaration for it. `before_agent_start` toggles it there, because pi
- * applies a `setActiveTools()` call made during that event to the run being prepared
- * (agent-session.js:1487-1492), which makes a model switch correct on its very next turn.
+ * (`defaultActive: false`) and activates exactly while the text is in force, because the text is
+ * what tells the model to call it. `before_agent_start` and `model_select` toggle it there: pi
+ * applies a `setActiveTools()` call made in either to the run being prepared.
  */
 
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { authorizeGate, GATE_FIELDS, GATE_TOOL, normalizeFields } from "./gate.js";
-import { isDeepSeekModel } from "./model.js";
+import { configPath, loadConfig, parseConfig, promptPath, resolve } from "./config.js";
+import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
+import { registerCommands } from "./commands.ts";
 
-// Legacy only: earlier versions recorded the text as a section under this name. The
-// load-time check stays so a transcript written by those versions can still be scrubbed.
+const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
+// Legacy only: earlier versions recorded the text as a section under this name. The load-time
+// check stays so a transcript written by those versions can still be scrubbed.
 const SECTION = "deepseek_policy";
 // The raw, untagged section holding pi's stock identity sentence.
 const PREAMBLE = "preamble";
-// Pi's stock preamble, byte for byte (dist/core/system-prompt.js:83, identical in 1.3.0 and
-// 1.4.0). Only this exact value is withheld: a copied-and-edited default prompt is the user's
-// own text and stays, and an unrelated custom system prompt lives in the same section.
+// Pi's stock preamble, byte for byte (dist/core/system-prompt.js, identical in 1.3.0 and 1.4.0).
+// Only this exact value is withheld: a copied-and-edited default prompt is the user's own text and
+// stays, and an unrelated custom system prompt lives in the same section.
 const STOCK_PREAMBLE =
 	"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
-const PROMPT_FILE = join(dirname(fileURLToPath(import.meta.url)), "prompt.md");
 
 /**
  * A plain JSON Schema, not a typebox builder: a typebox schema is JSON Schema, so pi sends and
@@ -79,65 +74,129 @@ const GATE_GUIDELINE =
 
 // Pi reports an invalid section name as a generic run error with no extension attribution.
 if (!/^[a-z][a-z0-9_-]*$/.test(SECTION) || SECTION === "preamble") {
-	throw new Error(`pi-deepseek-jailbreak: invalid section name ${SECTION}`);
+	throw new Error(`pi-jailbreak: invalid section name ${SECTION}`);
 }
 
-/**
- * The head's text when the prompt can go there, or undefined when the content holds anything pi
- * never puts in a system message: rewriting that would silently drop the other blocks.
- */
-function headText(content: any) {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return undefined;
-	// A single text block is what pi sends most often; read it without mapping or joining, so an
-	// already aligned request still allocates nothing.
-	if (content.length === 1 && content[0]?.type === "text") return content[0].text;
-	if (!content.every((block) => block?.type === "text")) return undefined;
-	return content.map((block) => block.text).join("\n");
-}
+/** The decision a run works from. `text` is null when the session runs normal or the file is unusable. */
+type Decision = {
+	key: string;
+	mode: "jailbreak" | "normal";
+	text: string | null;
+	prompt: string;
+	source: string;
+	inherit: string;
+	configPath: string | null;
+	error?: string;
+};
 
-let reported = new Set<string>();
+/** This session's own answer, mirrored into the environment for the processes it starts. */
+let override: { mode: "on" | "off"; key: string } | null = null;
+let decision: Decision | null = null;
+let api: ExtensionAPI;
 
-function report(ctx, message, type = "error") {
+const reported = new Set<string>();
+const promptCache = new Map<string, { mtimeMs: number; size: number; text: string }>();
+
+function report(ctx: any, message: string, type = "error") {
 	const key = `${type}:${message}`;
 	if (reported.has(key)) return;
 	try {
 		const ui = ctx?.ui;
 		if (!ui) return; // Headless: nothing is recorded, so a later UI session still gets told.
 		reported.add(key);
-		ui.notify(`pi-deepseek-jailbreak: ${message}`, type);
+		ui.notify(`pi-jailbreak: ${message}`, type);
 	} catch {
 		// A missing or inactive UI must not break the session.
 	}
 }
 
-/** Read prompt.md per run so edits take effect without a reload. */
-function readPrompt(ctx) {
-	let text;
+/** Read the text once per file revision. An unreadable or empty file leaves the run normal. */
+function readPrompt(path: string, ctx: any) {
 	try {
-		text = readFileSync(PROMPT_FILE, "utf8").trim();
+		const stat = statSync(path);
+		const hit = promptCache.get(path);
+		if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.text;
+		const text = readFileSync(path, "utf8").trim();
+		if (!text) {
+			report(ctx, `${basename(path)} is empty`);
+			return;
+		}
+		promptCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, text });
+		return text;
 	} catch {
-		report(ctx, "prompt.md unreadable");
-		return;
+		report(ctx, `${basename(path)} unreadable`);
 	}
-	if (!text) {
-		report(ctx, "prompt.md is empty");
-		return;
+}
+
+/** Whether the context carries a usable model. A missing provider or id is no model. */
+function hasModel(ctx: any) {
+	return Boolean(ctx?.model?.provider) && Boolean(ctx?.model?.id);
+}
+
+/** The decision for the live model, rebuilt only when the model key or the override changed. */
+function buildDecision(ctx: any): Decision {
+	const key = modelKey(ctx?.model);
+	if (decision && decision.key === key) return decision;
+	const loaded = loadConfig(configPath(), PACKAGE_DIR);
+	if (loaded.error) report(ctx, loaded.error);
+	const config = loaded.config;
+	const hit = resolve(config, ctx?.model);
+	// A tree answer covers every model in this process, which is what it publishes.
+	const session = override && (config.inherit === "tree" || applies(override, key)) ? override : null;
+	const mode = session ? (session.mode === "on" ? "jailbreak" : "normal") : hit.mode;
+	const prompt = promptPath(config, hit.prompt);
+	const text = mode === "jailbreak" ? readPrompt(prompt, ctx) ?? null : null;
+	decision = {
+		key,
+		mode,
+		text,
+		prompt,
+		source: session ? "session" : hit.ruleIndex < 0 ? "default" : `rule ${hit.ruleIndex + 1}`,
+		inherit: config.inherit,
+		configPath: config.path,
+		error: loaded.error,
+	};
+	return decision;
+}
+
+/** The head's text when the prompt can go there, or undefined when the content holds anything pi
+ * never puts in a system message: rewriting that would silently drop the other blocks. */
+function headText(content: any) {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return undefined;
+	if (content.length === 1 && content[0]?.type === "text") return content[0].text;
+	if (!content.every((block) => block?.type === "text")) return undefined;
+	return content.map((block) => block.text).join("\n");
+}
+
+/** Whether a section value is pi's stock preamble, the only one the text replaces. */
+function isStockPreamble(value: any) {
+	return value === STOCK_PREAMBLE;
+}
+
+/** A copy of `message` without `name` in its sections, dropping `sections` when it empties. */
+function withoutSection(message: any, name: string) {
+	const kept = { ...message.sections };
+	delete kept[name];
+	if (Object.keys(kept).length === 0) {
+		const rest = { ...message };
+		delete rest.sections;
+		return rest;
 	}
-	return text;
+	return { ...message, sections: kept };
 }
 
 /**
- * Copy `messages` with every legacy marker record removed, and while the text is in force
- * with the stock identity preamble removed from every system message. Returns undefined when
- * nothing needed to change.
+ * Copy `messages` with every legacy marker record removed, and while the text is in force with the
+ * stock identity preamble removed from every system message. Returns undefined when nothing needed
+ * to change.
  *
- * Both keys have to go from every system message, not only the leading one: pi unshifts its
- * own prompt patch at index 0 (agent-session.js:1525-1528), so the node carrying `preamble`
- * sits later, and a later system message is rendered by name (text.js:29-32). A `null`
- * marker record renders as a `Removed system prompt section` sentence, so it goes too.
+ * Both keys have to go from every system message, not only the leading one: pi unshifts its own
+ * prompt patch at index 0, so the node carrying `preamble` sits later, and a later system message
+ * is rendered by name. A `null` marker record renders as a `Removed system prompt section`
+ * sentence, so it goes too.
  */
-function project(messages, stripIdentity) {
+function project(messages: any[], stripIdentity: boolean) {
 	let next;
 	for (let i = 0; i < messages.length; i++) {
 		const message = messages[i];
@@ -153,54 +212,37 @@ function project(messages, stripIdentity) {
 	return next;
 }
 
-/** Whether a section value is pi's stock preamble, the only one the text replaces. */
-function isStockPreamble(value) {
-	return value === STOCK_PREAMBLE;
-}
-
-/** A copy of `message` without `name` in its sections, dropping `sections` when it empties. */
-function withoutSection(message, name) {
-	const kept = { ...message.sections };
-	delete kept[name];
-	if (Object.keys(kept).length === 0) {
-		const rest = { ...message };
-		delete rest.sections;
-		return rest;
-	}
-	return { ...message, sections: kept };
-}
-
 let gateBlocked = false;
 
 /**
- * Declare the gate to the model exactly while the session model is DeepSeek. Merging into the
- * live set keeps every other active tool; an unchanged set returns early, so a steady DeepSeek run
- * records no tool-set change and the prompt prefix stays cacheable.
+ * Declare the gate exactly while the text is in force. Merging into the live set keeps every other
+ * active tool; an unchanged set returns early, so a steady run records no tool-set change and the
+ * prompt prefix stays cacheable.
  */
-function syncGate(pi: ExtensionAPI, ctx) {
+function syncGate(want: boolean, ctx: any) {
 	// A name the allowlist or the exposure rules filter out never becomes active; one attempt is
 	// enough, and repeating it would rebuild the prompt on every run for nothing.
 	if (gateBlocked) return;
 	let active;
 	try {
-		active = pi.getActiveTools?.();
+		active = api.getActiveTools?.();
 	} catch {
 		return;
 	}
 	if (!Array.isArray(active)) return;
 	const has = active.includes(GATE_TOOL);
-	const want = isDeepSeekModel(ctx?.model);
 	if (want === has) return;
 	try {
-		pi.setActiveTools(want ? [...active, GATE_TOOL] : active.filter((name) => name !== GATE_TOOL));
-	} catch {
+		api.setActiveTools(want ? [...active, GATE_TOOL] : active.filter((name) => name !== GATE_TOOL));
+	} catch (error: any) {
 		gateBlocked = true;
+		report(ctx, `${GATE_TOOL} could not be activated: ${error?.message ?? "setActiveTools failed"}`, "warning");
 		return;
 	}
 	if (!want) return;
 	let now;
 	try {
-		now = pi.getActiveTools?.();
+		now = api.getActiveTools?.();
 	} catch {
 		return;
 	}
@@ -210,9 +252,149 @@ function syncGate(pi: ExtensionAPI, ctx) {
 	}
 }
 
-export default function deepseekJailbreak(pi: ExtensionAPI) {
-	// This run's prompt.md snapshot, refreshed at every run start so the guard never does I/O.
-	let promptText;
+function updateStatus(ctx: any, current: Decision) {
+	try {
+		ctx?.ui?.setStatus?.("jailbreak", current.text ? "jb on" : current.mode === "jailbreak" ? "jb !" : "jb off");
+	} catch {
+		// Status is decoration; a mode without a terminal must not fail a run.
+	}
+}
+
+/** The key a value is published under: one model for `keyed`, the whole tree for `tree`. */
+function publishKey(inherit: string, key: string) {
+	return inherit === "tree" ? "*" : key;
+}
+
+/**
+ * Publish this process's answer. A tree-wide answer narrows back to the live model when the config
+ * stops asking for the tree, and a process with no model yet publishes nothing rather than a key
+ * that matches every model.
+ */
+function syncChannel(ctx: any, inherit: string) {
+	// A tree answer from a parent becomes this model's answer once the config asks for keyed.
+	if (inherit === "keyed" && override?.key === "*") {
+		if (!hasModel(ctx)) {
+			publish(process.env, null, process.pid);
+			return;
+		}
+		override = { mode: override.mode, key: modelKey(ctx.model) };
+	}
+	publish(process.env, inherit === "none" || !override ? null : { ...override, key: publishKey(inherit, override.key) }, process.pid);
+}
+
+/** Replace this session's answer, mirror it for child processes, and apply it now. */
+function setOverride(ctx: any, mode: "on" | "off" | "toggle"): { mode: "on" | "off"; applied: boolean } {
+	if (!hasModel(ctx)) {
+		report(ctx, "no model selected", "warning");
+		decision = null;
+		const now = buildDecision(ctx);
+		return { mode: now.mode === "jailbreak" ? "on" : "off", applied: false };
+	}
+	const key = modelKey(ctx?.model);
+	const before = buildDecision(ctx);
+	const current = override && applies(override, key) ? override.mode : before.mode === "jailbreak" ? "on" : "off";
+	const next = mode === "toggle" ? (current === "on" ? "off" : "on") : mode;
+	override = { mode: next, key };
+	// Rebuild first: the config may have changed since the decision was made, and its `inherit`
+	// decides what the child processes see.
+	decision = null;
+	const after = buildDecision(ctx);
+	syncChannel(ctx, after.inherit);
+	syncGate(after.text !== null, ctx);
+	updateStatus(ctx, after);
+	return { mode: next, applied: true };
+}
+
+/** Drop this session's answer, so the config decides again. Returns the mode that now applies. */
+function clearOverride(ctx: any): "on" | "off" {
+	override = null;
+	decision = null;
+	publish(process.env, null, process.pid);
+	const current = buildDecision(ctx);
+	syncGate(current.text !== null, ctx);
+	updateStatus(ctx, current);
+	return current.mode === "jailbreak" ? "on" : "off";
+}
+
+/**
+ * Write the answer into the config file this session reads, as a rule for the current model.
+ * The file's other keys and the other rules are kept as they are. A file that does not parse is
+ * left untouched: replacing it would throw away the rules it still holds.
+ */
+function remember(ctx: any, mode: "on" | "off"): { ok: boolean; message: string } {
+	const provider = String(ctx?.model?.provider ?? "");
+	const id = String(ctx?.model?.id ?? "");
+	if (!hasModel(ctx)) return { ok: false, message: "nothing written: no model selected" };
+	const path = configPath();
+	let data: any = {};
+	try {
+		data = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") return { ok: false, message: `${path}: ${error?.message ?? "unreadable"}` };
+	}
+	const parsed = parseConfig(JSON.stringify(data), dirname(path));
+	if (parsed.error) return { ok: false, message: `${path}: ${parsed.error}` };
+	const rules = Array.isArray(data.rules) ? data.rules : [];
+	const at = rules.findIndex(
+		(rule: any) =>
+			typeof rule?.provider === "string" &&
+			typeof rule?.model === "string" &&
+			rule.provider.toLowerCase() === provider.toLowerCase() &&
+			rule.model.toLowerCase() === id.toLowerCase(),
+	);
+	const next = mode === "on" ? "jailbreak" : "normal";
+	// The first matching rule wins, so an exact rule behind a wildcard has to move up, not be
+	// edited where it sits.
+	if (at >= 0) {
+		const [updated] = rules.splice(at, 1);
+		rules.unshift({ ...updated, mode: next });
+	} else rules.unshift({ provider, model: id, mode: next });
+	const out = {
+		...data,
+		default: data.default ?? "normal",
+		inherit: data.inherit ?? "keyed",
+		prompt: data.prompt ?? "prompt.md",
+		rules,
+	};
+	const tmp = `${path}.${process.pid}.tmp`;
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(tmp, `${JSON.stringify(out, null, "\t")}\n`);
+		renameSync(tmp, path);
+	} catch (error: any) {
+		try {
+			rmSync(tmp, { force: true });
+		} catch {
+			// The report below says what failed; a stray temp file is not worth a second error.
+		}
+		return { ok: false, message: `${path}: ${error?.message ?? "write failed"}` };
+	}
+	setOverride(ctx, mode);
+	return { ok: true, message: path };
+}
+
+/** The panel: what the session resolved, and where each part came from. */
+function panel(ctx: any) {
+	// Read the config as it is now, not as the last run left it.
+	decision = null;
+	const current = buildDecision(ctx);
+	const inherited = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
+	const rows: string[][] = [
+		["model", hasModel(ctx) ? current.key : "(none)"],
+		["mode", current.mode],
+		["source", current.source],
+		["prompt", current.prompt],
+	];
+	if (current.mode === "jailbreak" && !current.text) rows.push(["text", "missing"]);
+	rows.push(["inherit", current.inherit], ["config", current.configPath ?? "none"]);
+	if (inherited) rows.push(["env", `${inherited.mode}@${inherited.key} ${applies(inherited, current.key) ? "applied" : "ignored"}`]);
+	if (current.error) rows.push(["error", current.error]);
+	const width = Math.max(...rows.map(([name]) => name.length)) + 2;
+	return rows.map(([name, value]) => `${name.padEnd(width)}${value}`).join("\n");
+}
+
+export default function jailbreak(pi: ExtensionAPI) {
+	api = pi;
 
 	pi.registerTool({
 		name: GATE_TOOL,
@@ -230,7 +412,7 @@ export default function deepseekJailbreak(pi: ExtensionAPI) {
 			if (input.fictional !== undefined) out.fictional = input.fictional;
 			return out;
 		},
-		// Dormant until a DeepSeek run activates it, so another model never sees a declaration.
+		// Dormant until a run in force activates it, so another model never sees a declaration.
 		defaultActive: false,
 		annotations: { readOnlyHint: true, idempotentHint: true },
 		async execute(toolCallId: string, params: any) {
@@ -249,11 +431,25 @@ export default function deepseekJailbreak(pi: ExtensionAPI) {
 		},
 	});
 
+	registerCommands(pi, { set: setOverride, reset: clearOverride, remember, panel });
+
 	// Module state outlives a session in the same process, and a new session carries its own flags:
 	// a session that could not activate the gate must not silence the next one.
-	pi.on("session_start", () => {
+	pi.on("session_start", (_event, ctx) => {
 		gateBlocked = false;
 		reported.clear();
+		const { config } = loadConfig(configPath(), PACKAGE_DIR);
+		// A value this process wrote survives its own next session; one a parent wrote is dropped
+		// when the config says this tree does not inherit. With no mirror at all, the answer this
+		// process already holds stands.
+		const inherited = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
+		if (inherited && (config.inherit !== "none" || inherited.self)) {
+			override = { mode: inherited.mode, key: inherited.key };
+		} else if (config.inherit === "none" && inherited && !inherited.self) override = null;
+		decision = null;
+		const current = buildDecision(ctx);
+		syncChannel(ctx, current.inherit);
+		updateStatus(ctx, current);
 	});
 
 	// A ruling has to be its own result: pi keeps a nested call out of the transcript, so a gate
@@ -264,32 +460,54 @@ export default function deepseekJailbreak(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
-		syncGate(pi, ctx);
-		promptText = readPrompt(ctx);
 		const options = event.systemPromptOptions;
-		const sections = options.sections;
 		// The transcript records nothing for the text; the guard projects it onto each request.
-		delete sections[SECTION];
-		if (!isDeepSeekModel(ctx.model)) return;
-		if (options.forceSystemPrompt !== undefined) {
-			report(ctx, "prompt is forced by another extension; the text is not delivered", "warning");
+		delete options.sections[SECTION];
+		// One decision per run: a config edited since the last one is read again here.
+		decision = null;
+		const current = buildDecision(ctx);
+		// A run start is where an edited `inherit` reaches the channel.
+		syncChannel(ctx, current.inherit);
+		syncGate(current.text !== null, ctx);
+		updateStatus(ctx, current);
+		if (current.text && options.forceSystemPrompt !== undefined) {
+			report(ctx, `${basename(current.prompt)} is not delivered (another extension replaced the system prompt)`, "warning");
 		}
+	});
+
+	// The guard reads the live model each request. A model switch rebuilds the decision on its next
+	// request; the gate declaration follows on the next run, because pi applies the tool set once
+	// per run. A blocked activation gets one more attempt, since the model that filtered it is gone.
+	pi.on("model_select", (_event, ctx) => {
+		gateBlocked = false;
+		decision = null;
+		const current = buildDecision(ctx);
+		syncChannel(ctx, current.inherit);
+		syncGate(current.text !== null, ctx);
+		updateStatus(ctx, current);
 	});
 
 	pi.on("context_with_system", (event, ctx) => {
 		const messages = event.messages;
 		if (!Array.isArray(messages) || messages.length === 0) return;
-		const isDeepSeek = isDeepSeekModel(ctx.model);
-		// A missing run-start snapshot falls back to the file, so the text still arrives.
-		const text = isDeepSeek ? (promptText ?? readPrompt(ctx)) : undefined;
-		let next = project(messages, text !== undefined);
+		const current = buildDecision(ctx);
+		let next = project(messages, current.text !== null);
 		const head = messages[0];
-		if (text !== undefined && head?.role === "system") {
+		if (current.text) {
 			const projected = next === undefined ? head : next[0];
-			const existing = headText(projected.content);
-			// Aligned: the text is already in the head, at the front or after a compacted summary.
-			if (existing !== undefined) {
-				const content = existing.includes(text) ? existing : existing ? `${text}\n\n${existing}` : text;
+			const existing = head?.role === "system" ? headText(projected.content) : undefined;
+			if (existing === undefined) {
+				// The head holds blocks pi never puts in a system message, or is not a system
+				// message at all. Rewriting it would drop content, so the text stays out, the
+				// identity sentence stays in, and the loss is reported.
+				next = project(messages, false);
+				report(ctx, `${basename(current.prompt)} is not delivered (the leading system message takes no text blocks)`, "warning");
+			} else {
+				// Idempotent: a head that already starts with the text is left as it is.
+				const aligned =
+					existing.startsWith(current.text) &&
+					(existing.length === current.text.length || /^\s*\n/.test(existing.slice(current.text.length)));
+				const content = aligned ? existing : existing ? `${current.text}\n\n${existing}` : current.text;
 				if (content !== existing) {
 					// Never mutate the caller's array, message objects or sections objects.
 					next ??= messages.slice();
