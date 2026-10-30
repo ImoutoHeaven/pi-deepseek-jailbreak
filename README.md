@@ -55,7 +55,9 @@ values are dropped).
 ```
 
 A session override lasts as long as the process, including `/new` and `/reload`, until
-`/jailbreak reset`. Nothing is written to disk unless `remember` asks for it.
+`/jailbreak reset`. Nothing is written to disk unless `remember` asks for it. Each loaded instance
+keeps its own answer, decision, delivery record and gate activation, so two sessions in one process
+do not share them, and the mode the process set is what a new instance reads.
 
 ## Commands
 
@@ -66,8 +68,10 @@ A session override lasts as long as the process, including `/new` and `/reload`,
 | `/jailbreak reset` | Drop the session answer, so the config decides again |
 | `/jailbreak remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, and apply it now |
 
-The footer shows `jb on` while the text is in force, `jb off` while the mode is normal, and `jb !`
-when the mode is jailbreak and the prompt file is missing or empty.
+The footer shows `JailBreak on` while the text is in force, `JailBreak off` while the mode is normal,
+and `JailBreak !` when the mode is jailbreak and the request carried nothing: the prompt file is
+missing or empty, or the transcript has nowhere to put the text. The third state follows the request
+that was actually sent, so a run whose text cannot be placed says so at once instead of showing on.
 
 ## Subagents
 
@@ -97,6 +101,12 @@ at. The `context_with_system` guard places the raw text, with no wrapper, ahead 
 renders that content first, so the order on a request is: `prompt.md` text, tools, rules, docs,
 project context, skills, working directory, MCP servers.
 
+The leading system message is the first system message in the transcript. An entry written before the
+first run, such as the `bashExecution` record of a `!command`, sits ahead of the prompt patch Pi
+appends for that run, so the guard finds the prompt where it is and moves it to index 0: the position
+Pi renders the prompt from, and the position where the text leads the request instead of trailing an
+earlier entry. A transcript that carries no system message has nowhere to put the text.
+
 While the text is in force pi's stock identity sentence is withheld: the same guard removes the
 `preamble` section from every system message whose value is exactly the 169-character sentence Pi
 ships, because that sentence contradicts the persona at the front of the same prompt. The comparison
@@ -110,8 +120,9 @@ file changes the head and costs one cache miss.
 
 If another extension forces the system prompt, Pi sends that string as the whole prompt. The identity
 sentence goes with the sections it replaces, and the extension reports the text as undelivered. When
-the leading system message holds blocks Pi never puts there, the extension leaves it alone and places
-nothing: the text stays out, the identity sentence stays in, and the loss is reported.
+the leading system message holds blocks Pi never puts there, or the transcript carries no system
+message at all, the extension places nothing: the text stays out, the identity sentence stays in, and
+the loss is reported.
 
 ## The authorization gate
 

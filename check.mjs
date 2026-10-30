@@ -375,6 +375,7 @@ const ui = () => {
 		setStatus: (key, value) => statuses.push([key, value]),
 	};
 };
+const lastStatus = (u) => u.statuses.at(-1)?.[1];
 const start = handler("session_start");
 const before = handler("before_agent_start");
 const guard = handler("context_with_system");
@@ -403,6 +404,7 @@ const guardRun = (messages, model = JAIL) => guard({ type: "context_with_system"
 	process.env[ENV_NAME] = "on@A/B";
 	await start({ type: "session_start", reason: "startup" }, ctx);
 	assert.notEqual(process.env[ENV_NAME], "on@A/B", "a value from outside the process tree is replaced");
+	assert.ok(process.env[ENV_NAME], "and something is published at all");
 	assert.equal(JSON.parse(process.env[ENV_NAME]).p, process.pid, "with this process as its publisher");
 
 	writeConfig([], { inherit: "none" });
@@ -464,7 +466,7 @@ console.log("ok gate activation");
 	assert.equal(switched, undefined, "the text follows the live model, not the run's first model");
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
-	assert.equal(u.statuses.at(-1)[1], "jb off", "a normal model shows off");
+	assert.equal(lastStatus(u), "JailBreak off", "a normal model shows off");
 	assert.equal(guard({ type: "context_with_system", messages }, { model: JAIL, ui: ui() })?.messages?.[0].content, promptText);
 }
 console.log("ok decision follows the model");
@@ -537,11 +539,37 @@ console.log("ok steady request is byte-identical");
 	assert.equal(u.notes.at(-1)[0], "warning");
 	assert.match(u.notes.at(-1)[1], /prompt\.md is not delivered/, "the warning names the file and the loss");
 	assert.equal(later.sections[PREAMBLE], STOCK_PREAMBLE, "the identity sentence stays when the text does not arrive");
+	assert.equal(lastStatus(u), "JailBreak !", "a request that carried nothing shows as such");
 	const u2 = ui();
-	assert.equal(guard({ type: "context_with_system", messages: [turn] }, { model: JAIL, ui: u2 }), undefined, "a transcript without a system head is left alone");
-	assert.equal(u2.notes.length, 0, "the same loss is reported once per session");
+	assert.equal(guard({ type: "context_with_system", messages: [turn] }, { model: JAIL, ui: u2 }), undefined, "a transcript without a system message is left alone");
+	assert.equal(u2.notes.length, 1, "that loss is reported too");
+	assert.match(u2.notes[0][1], /carries no system message/, "and the report names the missing message");
 }
 console.log("ok guard reports an unusable head");
+
+// A transcript whose first entry is not the prompt: the leading system message is found, the text
+// lands in it, and it moves to index 0, where pi renders the prompt.
+{
+	await run(JAIL);
+	const bash = { role: "bashExecution", command: "ls", output: "x", exitCode: 0, cancelled: false, truncated: false, timestamp: 1, excludeFromContext: false };
+	const prompt = head("", { [PREAMBLE]: STOCK_PREAMBLE, cwd: "C" });
+	const messages = [bash, prompt, turn];
+	const snapshot = JSON.parse(JSON.stringify(messages));
+	const u = ui();
+	const result = guard({ type: "context_with_system", messages }, { model: JAIL, ui: u });
+	assert.ok(result?.messages, "the text is delivered when the prompt does not lead the transcript");
+	assert.deepEqual(u.notes, [], "and nothing is reported as lost");
+	assert.equal(lastStatus(u), "JailBreak on", "a delivered request shows as on");
+	assert.equal(result.messages[0].role, "system", "the leading system message moves to index 0");
+	assert.equal(result.messages[0].content, promptText, "and carries the text");
+	assert.equal(result.messages[1], bash, "the entry that led the transcript follows it");
+	assert.ok(!Object.hasOwn(result.messages[0].sections, PREAMBLE), "the identity sentence is withheld");
+	assert.deepEqual(messages, snapshot, "the caller's transcript is untouched");
+	assert.equal(guard({ type: "context_with_system", messages: result.messages }, { model: JAIL, ui: ui() }), undefined, "the hoisted request is aligned on the next pass");
+	const later = [bash, { role: "system", content: "", sections: { [PREAMBLE]: STOCK_PREAMBLE, cwd: "C" }, timestamp: 2 }, turn];
+	assert.equal(guard({ type: "context_with_system", messages: later }, { model: NORMAL, ui: ui() }), undefined, "a normal session leaves the order alone");
+}
+console.log("ok guard hoists a late prompt");
 
 // A head that only ends like the text is not aligned.
 {
@@ -560,10 +588,77 @@ console.log("ok a false prefix is not aligned");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", prompt: join(tempDir, "gone.md") }]);
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: JAIL, ui: u });
-	assert.equal(u.statuses.at(-1)[1], "jb !", "a missing prompt shows as neither on nor off");
+	assert.equal(lastStatus(u), "JailBreak !", "a missing prompt shows as neither on nor off");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
 }
 console.log("ok a missing prompt is reported in the status");
+
+// The footer describes the request that was sent, not the decision that asked for it.
+{
+	const command = commands.get("jailbreak");
+	const u = ui();
+	await run(JAIL);
+	guard({ type: "context_with_system", messages: [turn] }, { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak !", "a request with nowhere to put the text says so");
+	await command.handler("off", { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak off", "a mode change reports the mode");
+	await command.handler("on", { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak on", "and the loss of an earlier request is not carried over");
+	guard({ type: "context_with_system", messages: [turn] }, { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak !");
+	await start({ type: "session_start", reason: "new" }, { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak on", "a new session starts from its own state");
+}
+console.log("ok status follows the request");
+
+// A forced prompt replaces the list after the guard, so that run carries nothing.
+{
+	const u = ui();
+	await before({ systemPromptOptions: { sections: {}, forceSystemPrompt: "FORCED" } }, { model: JAIL, ui: u });
+	guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak !", "a forced prompt shows as undelivered");
+	await run(JAIL);
+	guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak on", "and the next run without one recovers");
+}
+console.log("ok a forced prompt shows as undelivered");
+
+// Two sessions in one process keep their own gate declaration, status and delivery record.
+{
+	const runner = () => {
+		const own = [];
+		const names = ["read", "bash"];
+		def({
+			on: (name, fn) => own.push([name, fn]),
+			registerTool: () => {},
+			registerCommand: () => {},
+			getActiveTools: () => [...names],
+			setActiveTools: (next) => {
+				names.length = 0;
+				names.push(...next);
+			},
+		});
+		return {
+			active: names,
+			run: own.find(([name]) => name === "before_agent_start")[1],
+			guard: own.find(([name]) => name === "context_with_system")[1],
+		};
+	};
+	const a = runner();
+	const b = runner();
+	const ua = ui();
+	const ub = ui();
+	await a.run({ systemPromptOptions: { sections: {} } }, { model: JAIL, ui: ua });
+	await b.run({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: ub });
+	assert.equal(a.active.includes(GATE_TOOL), true, "the jailbreak session declares the gate");
+	assert.equal(b.active.includes(GATE_TOOL), false, "the normal session in the same process does not");
+	a.guard({ type: "context_with_system", messages: [turn] }, { model: JAIL, ui: ua });
+	assert.equal(lastStatus(ua), "JailBreak !", "one session's loss is its own");
+	assert.equal(lastStatus(ub), "JailBreak off", "and does not reach the other");
+	b.guard({ type: "context_with_system", messages: [head(""), turn] }, { model: NORMAL, ui: ub });
+	assert.equal(lastStatus(ua), "JailBreak !", "a normal session's request does not clear it either");
+}
+console.log("ok two sessions keep their own state");
 
 // A short text that already appears inside a sentence is still placed.
 {
@@ -759,6 +854,103 @@ console.log("ok reset reports the config mode");
 }
 console.log("ok override survives a new session");
 
+// A new runtime is a new load of the extension: the mode is the process's, not the runtime's.
+{
+	const runner = () => {
+		const own = [];
+		const names = ["read", "bash"];
+		const ownCommands = new Map();
+		def({
+			on: (name, fn) => own.push([name, fn]),
+			registerTool: () => {},
+			registerCommand: (name, definition) => ownCommands.set(name, definition),
+			getActiveTools: () => [...names],
+			setActiveTools: (next) => {
+				names.length = 0;
+				names.push(...next);
+			},
+		});
+		return {
+			active: names,
+			command: ownCommands.get("jailbreak"),
+			start: own.find(([name]) => name === "session_start")[1],
+			before: own.find(([name]) => name === "before_agent_start")[1],
+		};
+	};
+	// `none` publishes nothing, so a runtime that replaces this one has only the process answer.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }], { inherit: "none" });
+	const first = runner();
+	const ctx = { model: NORMAL, ui: ui() };
+	await first.start({ type: "session_start", reason: "startup" }, ctx);
+	await first.command.handler("on", ctx);
+	const second = runner();
+	const u = ui();
+	await second.start({ type: "session_start", reason: "new" }, { model: NORMAL, ui: u });
+	await second.before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
+	assert.equal(second.active.includes(GATE_TOOL), true, "a new runtime keeps the mode this process set");
+	assert.equal(lastStatus(u), "JailBreak on", "and reports it");
+	const third = runner();
+	await third.command.handler("reset", ctx);
+	const fourth = runner();
+	await fourth.start({ type: "session_start", reason: "new" }, { model: NORMAL, ui: ui() });
+	await fourth.before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: ui() });
+	assert.equal(fourth.active.includes(GATE_TOOL), false, "and a reset reaches the next runtime too");
+	// The process answer is keyed: a runtime on another model still resolves from the config.
+	const first2 = runner();
+	await first2.command.handler("on", ctx);
+	const elsewhere = { provider: "zhipu", id: "glm-5" };
+	const fifth = runner();
+	const u5 = ui();
+	await fifth.start({ type: "session_start", reason: "new" }, { model: elsewhere, ui: u5 });
+	await fifth.before({ systemPromptOptions: { sections: {} } }, { model: elsewhere, ui: u5 });
+	assert.equal(fifth.active.includes(GATE_TOOL), false, "the process answer does not cover another model");
+	await third.command.handler("reset", ctx);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
+}
+console.log("ok a new runtime keeps the process answer");
+
+// `/reload` re-evaluates this module: the process answer outlives the module instance.
+{
+	const runner = (factory) => {
+		const own = [];
+		const names = ["read", "bash"];
+		const ownCommands = new Map();
+		factory({
+			on: (name, fn) => own.push([name, fn]),
+			registerTool: () => {},
+			registerCommand: (name, definition) => ownCommands.set(name, definition),
+			getActiveTools: () => [...names],
+			setActiveTools: (next) => {
+				names.length = 0;
+				names.push(...next);
+			},
+		});
+		return {
+			active: names,
+			command: ownCommands.get("jailbreak"),
+			start: own.find(([name]) => name === "session_start")[1],
+			before: own.find(([name]) => name === "before_agent_start")[1],
+		};
+	};
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }], { inherit: "none" });
+	const first = runner(def);
+	const ctx = { model: NORMAL, ui: ui() };
+	await first.start({ type: "session_start", reason: "startup" }, ctx);
+	await first.command.handler("on", ctx);
+	const reloaded = runner((await import(`./index.ts?reload=${Date.now()}`)).default);
+	const u = ui();
+	await reloaded.start({ type: "session_start", reason: "reload" }, { model: NORMAL, ui: u });
+	await reloaded.before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
+	assert.equal(reloaded.active.includes(GATE_TOOL), true, "a reloaded module keeps the mode this process set");
+	await first.command.handler("reset", ctx);
+	const afterReset = runner((await import(`./index.ts?reset=${Date.now()}`)).default);
+	await afterReset.start({ type: "session_start", reason: "reload" }, { model: NORMAL, ui: ui() });
+	await afterReset.before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: ui() });
+	assert.equal(afterReset.active.includes(GATE_TOOL), false, "and a reset survives the reload too");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
+}
+console.log("ok a reloaded module keeps the process answer");
+
 // inherit decides the published key.
 {
 	const command = commands.get("jailbreak");
@@ -807,7 +999,7 @@ console.log("ok a keyed config narrows a tree answer");
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
 	assert.equal(activeTools.includes(GATE_TOOL), true, "the tree answer covers another model in this process");
-	assert.equal(u.statuses.at(-1)[1], "jb on");
+	assert.equal(lastStatus(u), "JailBreak on");
 	// The next run picks up the config going back to keyed, and narrows the channel with it.
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }], { inherit: "keyed" });
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
@@ -825,10 +1017,10 @@ console.log("ok a tree answer covers the process");
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "openai/gpt-5", "an inherited tree answer narrows to this model");
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
-	assert.equal(u.statuses.at(-1)[1], "jb on", "and applies to it");
+	assert.equal(lastStatus(u), "JailBreak on", "and applies to it");
 	await before({ systemPromptOptions: { sections: {} } }, { model: { provider: "other", id: "model" }, ui: u });
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "openai/gpt-5", "the narrowed key stays with the model that had it");
-	assert.equal(u.statuses.at(-1)[1], "jb off", "the other model falls back to the config");
+	assert.equal(lastStatus(u), "JailBreak off", "the other model falls back to the config");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
 }
 console.log("ok an inherited tree answer narrows");
@@ -902,6 +1094,14 @@ console.log("ok a refused tool-set write is reported");
 	await select({ type: "model_select", model: NORMAL }, { model: NORMAL, ui: u });
 	assert.equal(activeTools.includes(GATE_TOOL), false, "the tool set follows the selected model");
 	assert.equal(guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: NORMAL, ui: u }), undefined);
+	// A loss belongs to the request that produced it, not to a model the session came back to.
+	await select({ type: "model_select", model: JAIL }, { model: JAIL, ui: u });
+	guard({ type: "context_with_system", messages: [turn] }, { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak !", "a loss shows on the model that lost it");
+	await select({ type: "model_select", model: NORMAL }, { model: NORMAL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak off", "and not on another model");
+	await select({ type: "model_select", model: JAIL }, { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak on", "nor after switching back, before a new request");
 }
 console.log("ok model_select");
 
@@ -1091,7 +1291,7 @@ console.log("ok gate");
 	const block = readme.split("```json\n")[1]?.split("```")[0];
 	assert.ok(block, "README carries the example as a json block");
 	assert.deepEqual(JSON.parse(block), example, "the README block and the example file agree");
-	assert.ok(readme.includes("jb !"), "the footer's third state is documented");
+	assert.ok(readme.includes("JailBreak !"), "the footer's third state is documented");
 }
 console.log("ok example config");
 

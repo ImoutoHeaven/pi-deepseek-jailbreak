@@ -7,6 +7,12 @@
  * transcript records nothing for it, so nothing is persisted, nothing leaks to another model, and
  * an unchanged run sends byte-identical prompts turn after turn.
  *
+ * The leading system message is the first system message in the transcript, not the entry at index
+ * 0: an entry written before the first run, such as the `bashExecution` record of a `!command`, sits
+ * ahead of the prompt patch pi appends for that run. Pi reads the prompt from index 0 alone, so a
+ * leading system message found later moves to index 0 while the text is in force, which is also
+ * where the provider renders it as the prompt instead of as a mid-conversation section update.
+ *
  * The text contradicts the stock identity sentence that opens pi's default preamble, so the guard
  * withholds that sentence while the text is in force and lets it back the moment the text is not.
  * It withholds it on every system message, not only the leading one, and only when the value is
@@ -89,42 +95,73 @@ type Decision = {
 	error?: string;
 };
 
-/** This session's own answer, mirrored into the environment for the processes it starts. */
-let override: { mode: "on" | "off"; key: string } | null = null;
-let decision: Decision | null = null;
-let api: ExtensionAPI;
+/**
+ * The answer this process set, so a new runtime in the same process keeps it. Pi loads the
+ * extension again for `/new`, a fork or a session switch, and `/reload` re-evaluates this module,
+ * so the value lives on the process instead of in module memory.
+ */
+const PROCESS_ANSWER = Symbol.for("pi-jailbreak.process-answer");
 
-const reported = new Set<string>();
+function readProcessAnswer(): { mode: "on" | "off"; key: string } | null {
+	const value = (globalThis as any)[PROCESS_ANSWER];
+	if (!value || typeof value !== "object") return null;
+	return value.mode === "on" || value.mode === "off" ? { mode: value.mode, key: String(value.key ?? "") } : null;
+}
+
+function writeProcessAnswer(next: { mode: "on" | "off"; key: string } | null) {
+	(globalThis as any)[PROCESS_ANSWER] = next ? { ...next } : null;
+}
+
+/**
+ * Everything one loaded extension instance owns. Pi calls the factory once per runner, so two
+ * sessions in one process each keep their own answer, decision, delivery record, gate activation
+ * and reported set. Only the prompt cache and the process answer are shared.
+ */
+type State = {
+	api: ExtensionAPI;
+	/** This session's own answer, mirrored into the environment for the processes it starts. */
+	override: { mode: "on" | "off"; key: string } | null;
+	/** What the last request sent actually carried, keyed like a decision. */
+	delivery: { key: string; prompt: string; delivered: boolean } | null;
+	decision: Decision | null;
+	reported: Set<string>;
+	gateBlocked: boolean;
+	/** Whether the run being prepared sends a forced prompt, which drops the text after the guard. */
+	forced: boolean;
+};
+
 const promptCache = new Map<string, { mtimeMs: number; size: number; text: string }>();
 
-function report(ctx: any, message: string, type = "error") {
+function report(s: State, ctx: any, message: string, type = "error") {
 	const key = `${type}:${message}`;
-	if (reported.has(key)) return;
+	if (s.reported.has(key)) return;
 	try {
 		const ui = ctx?.ui;
-		if (!ui) return; // Headless: nothing is recorded, so a later UI session still gets told.
-		reported.add(key);
+		// A headless session carries a UI that shows nothing, so the message waits for one that does.
+		if (!ui || ctx?.hasUI === false) return;
 		ui.notify(`pi-jailbreak: ${message}`, type);
+		// Recorded only once it is shown, so a UI that throws is told again rather than silenced.
+		s.reported.add(key);
 	} catch {
 		// A missing or inactive UI must not break the session.
 	}
 }
 
 /** Read the text once per file revision. An unreadable or empty file leaves the run normal. */
-function readPrompt(path: string, ctx: any) {
+function readPrompt(s: State, path: string, ctx: any) {
 	try {
 		const stat = statSync(path);
 		const hit = promptCache.get(path);
 		if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.text;
 		const text = readFileSync(path, "utf8").trim();
 		if (!text) {
-			report(ctx, `${basename(path)} is empty`);
+			report(s, ctx, `${basename(path)} is empty`);
 			return;
 		}
 		promptCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, text });
 		return text;
 	} catch {
-		report(ctx, `${basename(path)} unreadable`);
+		report(s, ctx, `${basename(path)} unreadable`);
 	}
 }
 
@@ -134,19 +171,19 @@ function hasModel(ctx: any) {
 }
 
 /** The decision for the live model, rebuilt only when the model key or the override changed. */
-function buildDecision(ctx: any): Decision {
+function buildDecision(s: State, ctx: any): Decision {
 	const key = modelKey(ctx?.model);
-	if (decision && decision.key === key) return decision;
+	if (s.decision && s.decision.key === key) return s.decision;
 	const loaded = loadConfig(configPath(), PACKAGE_DIR);
-	if (loaded.error) report(ctx, loaded.error);
+	if (loaded.error) report(s, ctx, loaded.error);
 	const config = loaded.config;
 	const hit = resolve(config, ctx?.model);
 	// A tree answer covers every model in this process, which is what it publishes.
-	const session = override && (config.inherit === "tree" || applies(override, key)) ? override : null;
+	const session = s.override && (config.inherit === "tree" || applies(s.override, key)) ? s.override : null;
 	const mode = session ? (session.mode === "on" ? "jailbreak" : "normal") : hit.mode;
 	const prompt = promptPath(config, hit.prompt);
-	const text = mode === "jailbreak" ? readPrompt(prompt, ctx) ?? null : null;
-	decision = {
+	const text = mode === "jailbreak" ? readPrompt(s, prompt, ctx) ?? null : null;
+	s.decision = {
 		key,
 		mode,
 		text,
@@ -156,7 +193,7 @@ function buildDecision(ctx: any): Decision {
 		configPath: config.path,
 		error: loaded.error,
 	};
-	return decision;
+	return s.decision;
 }
 
 /** The head's text when the prompt can go there, or undefined when the content holds anything pi
@@ -167,6 +204,12 @@ function headText(content: any) {
 	if (content.length === 1 && content[0]?.type === "text") return content[0].text;
 	if (!content.every((block) => block?.type === "text")) return undefined;
 	return content.map((block) => block.text).join("\n");
+}
+
+/** The index of the leading system message, or -1 when the transcript carries none. */
+function leadingSystem(messages: any[]) {
+	for (let i = 0; i < messages.length; i++) if (messages[i]?.role === "system") return i;
+	return -1;
 }
 
 /** Whether a section value is pi's stock preamble, the only one the text replaces. */
@@ -212,20 +255,18 @@ function project(messages: any[], stripIdentity: boolean) {
 	return next;
 }
 
-let gateBlocked = false;
-
 /**
  * Declare the gate exactly while the text is in force. Merging into the live set keeps every other
  * active tool; an unchanged set returns early, so a steady run records no tool-set change and the
  * prompt prefix stays cacheable.
  */
-function syncGate(want: boolean, ctx: any) {
+function syncGate(s: State, want: boolean, ctx: any) {
 	// A name the allowlist or the exposure rules filter out never becomes active; one attempt is
 	// enough, and repeating it would rebuild the prompt on every run for nothing.
-	if (gateBlocked) return;
+	if (s.gateBlocked) return;
 	let active;
 	try {
-		active = api.getActiveTools?.();
+		active = s.api.getActiveTools?.();
 	} catch {
 		return;
 	}
@@ -233,31 +274,57 @@ function syncGate(want: boolean, ctx: any) {
 	const has = active.includes(GATE_TOOL);
 	if (want === has) return;
 	try {
-		api.setActiveTools(want ? [...active, GATE_TOOL] : active.filter((name) => name !== GATE_TOOL));
+		s.api.setActiveTools(want ? [...active, GATE_TOOL] : active.filter((name) => name !== GATE_TOOL));
 	} catch (error: any) {
-		gateBlocked = true;
-		report(ctx, `${GATE_TOOL} could not be activated: ${error?.message ?? "setActiveTools failed"}`, "warning");
+		s.gateBlocked = true;
+		report(s, ctx, `${GATE_TOOL} could not be activated: ${error?.message ?? "setActiveTools failed"}`, "warning");
 		return;
 	}
 	if (!want) return;
 	let now;
 	try {
-		now = api.getActiveTools?.();
+		now = s.api.getActiveTools?.();
 	} catch {
 		return;
 	}
 	if (Array.isArray(now) && !now.includes(GATE_TOOL)) {
-		gateBlocked = true;
-		report(ctx, `${GATE_TOOL} cannot be activated in this session`, "warning");
+		s.gateBlocked = true;
+		report(s, ctx, `${GATE_TOOL} cannot be activated in this session`, "warning");
 	}
 }
 
-function updateStatus(ctx: any, current: Decision) {
+function updateStatus(s: State, ctx: any, current: Decision) {
+	const state = !current.text
+		? current.mode === "jailbreak"
+			? "JailBreak !"
+			: "JailBreak off"
+		: s.delivery && s.delivery.key === current.key && s.delivery.prompt === current.prompt && !s.delivery.delivered
+			? "JailBreak !"
+			: "JailBreak on";
 	try {
-		ctx?.ui?.setStatus?.("jailbreak", current.text ? "jb on" : current.mode === "jailbreak" ? "jb !" : "jb off");
+		ctx?.ui?.setStatus?.("jailbreak", state);
 	} catch {
 		// Status is decoration; a mode without a terminal must not fail a run.
 	}
+}
+
+/** Record what a request carried, and show the loss the moment it happens. */
+function noteDelivery(s: State, ctx: any, current: Decision, delivered: boolean) {
+	const before = s.delivery;
+	s.delivery = { key: current.key, prompt: current.prompt, delivered };
+	if (before && before.key === s.delivery.key && before.prompt === s.delivery.prompt && before.delivered === delivered) return;
+	updateStatus(s, ctx, current);
+}
+
+/** Forget the delivery of a request that a mode or session change no longer describes. */
+function forgetDelivery(s: State) {
+	s.delivery = null;
+}
+
+/** Set this session's answer and the process answer that survives a new runtime. */
+function setAnswer(s: State, next: { mode: "on" | "off"; key: string } | null) {
+	s.override = next;
+	writeProcessAnswer(next);
 }
 
 /** The key a value is published under: one model for `keyed`, the whole tree for `tree`. */
@@ -270,49 +337,53 @@ function publishKey(inherit: string, key: string) {
  * stops asking for the tree, and a process with no model yet publishes nothing rather than a key
  * that matches every model.
  */
-function syncChannel(ctx: any, inherit: string) {
+function syncChannel(s: State, ctx: any, inherit: string) {
 	// A tree answer from a parent becomes this model's answer once the config asks for keyed.
-	if (inherit === "keyed" && override?.key === "*") {
+	if (inherit === "keyed" && s.override?.key === "*") {
 		if (!hasModel(ctx)) {
 			publish(process.env, null, process.pid);
 			return;
 		}
-		override = { mode: override.mode, key: modelKey(ctx.model) };
+		s.override = { mode: s.override.mode, key: modelKey(ctx.model) };
+		writeProcessAnswer(s.override);
 	}
-	publish(process.env, inherit === "none" || !override ? null : { ...override, key: publishKey(inherit, override.key) }, process.pid);
+	publish(process.env, inherit === "none" || !s.override ? null : { ...s.override, key: publishKey(inherit, s.override.key) }, process.pid);
 }
 
 /** Replace this session's answer, mirror it for child processes, and apply it now. */
-function setOverride(ctx: any, mode: "on" | "off" | "toggle"): { mode: "on" | "off"; applied: boolean } {
+function setOverride(s: State, ctx: any, mode: "on" | "off" | "toggle"): { mode: "on" | "off"; applied: boolean } {
 	if (!hasModel(ctx)) {
-		report(ctx, "no model selected", "warning");
-		decision = null;
-		const now = buildDecision(ctx);
+		report(s, ctx, "no model selected", "warning");
+		s.decision = null;
+		const now = buildDecision(s, ctx);
 		return { mode: now.mode === "jailbreak" ? "on" : "off", applied: false };
 	}
 	const key = modelKey(ctx?.model);
-	const before = buildDecision(ctx);
-	const current = override && applies(override, key) ? override.mode : before.mode === "jailbreak" ? "on" : "off";
+	const before = buildDecision(s, ctx);
+	const current = s.override && applies(s.override, key) ? s.override.mode : before.mode === "jailbreak" ? "on" : "off";
 	const next = mode === "toggle" ? (current === "on" ? "off" : "on") : mode;
-	override = { mode: next, key };
+	setAnswer(s, { mode: next, key });
+	// A mode change describes a request that has not been sent yet.
+	forgetDelivery(s);
 	// Rebuild first: the config may have changed since the decision was made, and its `inherit`
 	// decides what the child processes see.
-	decision = null;
-	const after = buildDecision(ctx);
-	syncChannel(ctx, after.inherit);
-	syncGate(after.text !== null, ctx);
-	updateStatus(ctx, after);
+	s.decision = null;
+	const after = buildDecision(s, ctx);
+	syncChannel(s, ctx, after.inherit);
+	syncGate(s, after.text !== null, ctx);
+	updateStatus(s, ctx, after);
 	return { mode: next, applied: true };
 }
 
 /** Drop this session's answer, so the config decides again. Returns the mode that now applies. */
-function clearOverride(ctx: any): "on" | "off" {
-	override = null;
-	decision = null;
+function clearOverride(s: State, ctx: any): "on" | "off" {
+	setAnswer(s, null);
+	s.decision = null;
+	forgetDelivery(s);
 	publish(process.env, null, process.pid);
-	const current = buildDecision(ctx);
-	syncGate(current.text !== null, ctx);
-	updateStatus(ctx, current);
+	const current = buildDecision(s, ctx);
+	syncGate(s, current.text !== null, ctx);
+	updateStatus(s, ctx, current);
 	return current.mode === "jailbreak" ? "on" : "off";
 }
 
@@ -321,7 +392,7 @@ function clearOverride(ctx: any): "on" | "off" {
  * The file's other keys and the other rules are kept as they are. A file that does not parse is
  * left untouched: replacing it would throw away the rules it still holds.
  */
-function remember(ctx: any, mode: "on" | "off"): { ok: boolean; message: string } {
+function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; message: string } {
 	const provider = String(ctx?.model?.provider ?? "");
 	const id = String(ctx?.model?.id ?? "");
 	if (!hasModel(ctx)) return { ok: false, message: "nothing written: no model selected" };
@@ -369,15 +440,15 @@ function remember(ctx: any, mode: "on" | "off"): { ok: boolean; message: string 
 		}
 		return { ok: false, message: `${path}: ${error?.message ?? "write failed"}` };
 	}
-	setOverride(ctx, mode);
+	setOverride(s, ctx, mode);
 	return { ok: true, message: path };
 }
 
 /** The panel: what the session resolved, and where each part came from. */
-function panel(ctx: any) {
+function panel(s: State, ctx: any) {
 	// Read the config as it is now, not as the last run left it.
-	decision = null;
-	const current = buildDecision(ctx);
+	s.decision = null;
+	const current = buildDecision(s, ctx);
 	const inherited = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
 	const rows: string[][] = [
 		["model", hasModel(ctx) ? current.key : "(none)"],
@@ -394,7 +465,7 @@ function panel(ctx: any) {
 }
 
 export default function jailbreak(pi: ExtensionAPI) {
-	api = pi;
+	const s: State = { api: pi, override: null, delivery: null, decision: null, reported: new Set(), gateBlocked: false, forced: false };
 
 	pi.registerTool({
 		name: GATE_TOOL,
@@ -431,25 +502,40 @@ export default function jailbreak(pi: ExtensionAPI) {
 		},
 	});
 
-	registerCommands(pi, { set: setOverride, reset: clearOverride, remember, panel });
+	registerCommands(pi, {
+		set: (ctx, mode) => setOverride(s, ctx, mode),
+		reset: (ctx) => clearOverride(s, ctx),
+		remember: (ctx, mode) => remember(s, ctx, mode),
+		panel: (ctx) => panel(s, ctx),
+	});
 
-	// Module state outlives a session in the same process, and a new session carries its own flags:
-	// a session that could not activate the gate must not silence the next one.
+	// State outlives a session in the same process, and a new session carries its own flags: a
+	// session that could not activate the gate must not silence the next one, and the delivery
+	// recorded for the previous session must not describe this one.
 	pi.on("session_start", (_event, ctx) => {
-		gateBlocked = false;
-		reported.clear();
+		s.gateBlocked = false;
+		s.reported.clear();
+		forgetDelivery(s);
 		const { config } = loadConfig(configPath(), PACKAGE_DIR);
 		// A value this process wrote survives its own next session; one a parent wrote is dropped
 		// when the config says this tree does not inherit. With no mirror at all, the answer this
 		// process already holds stands.
 		const inherited = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
 		if (inherited && (config.inherit !== "none" || inherited.self)) {
-			override = { mode: inherited.mode, key: inherited.key };
-		} else if (config.inherit === "none" && inherited && !inherited.self) override = null;
-		decision = null;
-		const current = buildDecision(ctx);
-		syncChannel(ctx, current.inherit);
-		updateStatus(ctx, current);
+			s.override = { mode: inherited.mode, key: inherited.key };
+		} else if (config.inherit === "none" && inherited && !inherited.self) {
+			// A parent's answer is dropped when this tree does not inherit.
+			s.override = null;
+		} else {
+			// A runtime that replaces this one carries no channel under `none`, and `/reload`
+			// re-evaluates this module, so the answer this process set is what keeps the mode
+			// across `/new`, a fork, a session switch and `/reload`.
+			s.override = readProcessAnswer();
+		}
+		s.decision = null;
+		const current = buildDecision(s, ctx);
+		syncChannel(s, ctx, current.inherit);
+		updateStatus(s, ctx, current);
 	});
 
 	// A ruling has to be its own result: pi keeps a nested call out of the transcript, so a gate
@@ -464,14 +550,17 @@ export default function jailbreak(pi: ExtensionAPI) {
 		// The transcript records nothing for the text; the guard projects it onto each request.
 		delete options.sections[SECTION];
 		// One decision per run: a config edited since the last one is read again here.
-		decision = null;
-		const current = buildDecision(ctx);
+		s.decision = null;
+		const current = buildDecision(s, ctx);
+		// A forced prompt replaces the whole message list after the guard has run, so the text
+		// built there never reaches the request.
+		s.forced = options.forceSystemPrompt !== undefined;
 		// A run start is where an edited `inherit` reaches the channel.
-		syncChannel(ctx, current.inherit);
-		syncGate(current.text !== null, ctx);
-		updateStatus(ctx, current);
-		if (current.text && options.forceSystemPrompt !== undefined) {
-			report(ctx, `${basename(current.prompt)} is not delivered (another extension replaced the system prompt)`, "warning");
+		syncChannel(s, ctx, current.inherit);
+		syncGate(s, current.text !== null, ctx);
+		updateStatus(s, ctx, current);
+		if (current.text && s.forced) {
+			report(s, ctx, `${basename(current.prompt)} is not delivered (another extension replaced the system prompt)`, "warning");
 		}
 	});
 
@@ -479,42 +568,59 @@ export default function jailbreak(pi: ExtensionAPI) {
 	// request; the gate declaration follows on the next run, because pi applies the tool set once
 	// per run. A blocked activation gets one more attempt, since the model that filtered it is gone.
 	pi.on("model_select", (_event, ctx) => {
-		gateBlocked = false;
-		decision = null;
-		const current = buildDecision(ctx);
-		syncChannel(ctx, current.inherit);
-		syncGate(current.text !== null, ctx);
-		updateStatus(ctx, current);
+		s.gateBlocked = false;
+		s.decision = null;
+		forgetDelivery(s);
+		const current = buildDecision(s, ctx);
+		syncChannel(s, ctx, current.inherit);
+		syncGate(s, current.text !== null, ctx);
+		updateStatus(s, ctx, current);
 	});
 
 	pi.on("context_with_system", (event, ctx) => {
 		const messages = event.messages;
 		if (!Array.isArray(messages) || messages.length === 0) return;
-		const current = buildDecision(ctx);
+		const current = buildDecision(s, ctx);
 		let next = project(messages, current.text !== null);
-		const head = messages[0];
 		if (current.text) {
-			const projected = next === undefined ? head : next[0];
-			const existing = head?.role === "system" ? headText(projected.content) : undefined;
+			const at = leadingSystem(messages);
+			const projected = at < 0 ? undefined : next === undefined ? messages[at] : next[at];
+			const existing = projected ? headText(projected.content) : undefined;
 			if (existing === undefined) {
-				// The head holds blocks pi never puts in a system message, or is not a system
-				// message at all. Rewriting it would drop content, so the text stays out, the
-				// identity sentence stays in, and the loss is reported.
+				// The transcript carries no system message, or the leading one holds blocks pi
+				// never puts there. Rewriting either would drop content, so the text stays out,
+				// the identity sentence stays in, and the loss is reported.
 				next = project(messages, false);
-				report(ctx, `${basename(current.prompt)} is not delivered (the leading system message takes no text blocks)`, "warning");
+				report(
+					s,
+					ctx,
+					at < 0
+						? `${basename(current.prompt)} is not delivered (the transcript carries no system message)`
+						: `${basename(current.prompt)} is not delivered (the leading system message takes no text blocks)`,
+					"warning",
+				);
 			} else {
 				// Idempotent: a head that already starts with the text is left as it is.
 				const aligned =
 					existing.startsWith(current.text) &&
 					(existing.length === current.text.length || /^\s*\n/.test(existing.slice(current.text.length)));
 				const content = aligned ? existing : existing ? `${current.text}\n\n${existing}` : current.text;
-				if (content !== existing) {
+				if (content !== existing || at !== 0) {
 					// Never mutate the caller's array, message objects or sections objects.
 					next ??= messages.slice();
-					next[0] = { ...projected, content };
+					next[at] = { ...projected, content };
+					if (at !== 0) {
+						// Pi renders the prompt from index 0 only, so the leading system message
+						// moves up to where it is the prompt rather than a section update.
+						const [moved] = next.splice(at, 1);
+						next.unshift(moved);
+					}
 				}
 			}
-		}
+			// The footer reports what the request carried, not only what the mode asked for. A forced
+			// prompt replaces the list after this point, so that run carries nothing either.
+			noteDelivery(s, ctx, current, existing !== undefined && !s.forced);
+		} else forgetDelivery(s);
 		// Aligned: return undefined so the request stays byte-identical and allocation-free.
 		return next === undefined ? undefined : { messages: next };
 	});
