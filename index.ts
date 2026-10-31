@@ -405,6 +405,10 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	}
 	const parsed = parseConfig(JSON.stringify(data), dirname(path));
 	if (parsed.error) return { ok: false, message: `${path}: ${parsed.error}` };
+	// The rule that governs this model now. The rule this command writes takes over its text, or
+	// remembering a mode would silently switch the model to the default prompt file.
+	const applied = resolve(parsed.config, ctx?.model);
+	const carried = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].prompt : undefined;
 	const rules = Array.isArray(data.rules) ? data.rules : [];
 	const at = rules.findIndex(
 		(rule: any) =>
@@ -418,8 +422,8 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// edited where it sits.
 	if (at >= 0) {
 		const [updated] = rules.splice(at, 1);
-		rules.unshift({ ...updated, mode: next });
-	} else rules.unshift({ provider, model: id, mode: next });
+		rules.unshift({ ...updated, mode: next, ...(updated.prompt === undefined && carried ? { prompt: carried } : {}) });
+	} else rules.unshift({ provider, model: id, mode: next, ...(carried ? { prompt: carried } : {}) });
 	const out = {
 		...data,
 		default: data.default ?? "normal",

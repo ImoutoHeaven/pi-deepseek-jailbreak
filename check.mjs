@@ -809,6 +809,60 @@ console.log("ok remember keeps foreign keys");
 }
 console.log("ok remember moves a shadowed rule");
 
+// Remembering a mode keeps the prompt file the model already resolves to: a rule written for the
+// current model takes over its text, whether the rule is updated where it sits or moved forward.
+{
+	const command = commands.get("jailbreak");
+	const custom = join(tempDir, "custom.md");
+	writeFileSync(custom, "CUSTOM");
+	const resolved = () => resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, JAIL);
+
+	// The wildcard is the rule in force, so the new exact rule inherits its prompt.
+	writeFileSync(
+		configFile,
+		JSON.stringify({
+			default: "normal",
+			rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", prompt: custom }],
+		}),
+	);
+	assert.equal(resolved().prompt, custom);
+	await command.handler("remember off", { model: JAIL, ui: ui() });
+	let data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].mode, "normal");
+	assert.equal(data.rules[0].prompt, custom, "the rule that takes over keeps the text in force");
+	await command.handler("remember on", { model: JAIL, ui: ui() });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules.length, 2, "the exact rule is updated, not duplicated");
+	assert.equal(data.rules[0].mode, "jailbreak");
+	assert.equal(resolved().prompt, custom, "and the model still reads the same file");
+
+	// The exact rule sits behind the wildcard and has no prompt of its own.
+	writeFileSync(
+		configFile,
+		JSON.stringify({
+			default: "normal",
+			rules: [
+				{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "normal", prompt: custom },
+				{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "jailbreak" },
+			],
+		}),
+	);
+	await command.handler("remember on", { model: JAIL, ui: ui() });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules.length, 2, "the shadowed rule is moved, not duplicated");
+	assert.equal(data.rules[0].prompt, custom, "the moved rule keeps the text the wildcard gave it");
+	assert.equal(resolved().prompt, custom);
+	assert.equal(resolved().ruleIndex, 0);
+
+	// A model with no rule of its own keeps the config default, unwritten.
+	writeConfig([{ provider: "openai", model: "gpt-*", mode: "jailbreak", prompt: custom }]);
+	await command.handler("remember on", { model: JAIL, ui: ui() });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].prompt, undefined, "no rule in force leaves the default prompt alone");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
+}
+console.log("ok remember keeps the prompt in force");
+
 // A file that does not parse is left alone, and the command says so.
 {
 	const command = commands.get("jailbreak");

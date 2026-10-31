@@ -66,7 +66,7 @@ do not share them, and the mode the process set is what a new instance reads.
 | `/jailbreak` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the prompt file, the config file, and the inherited value if there is one |
 | `/jailbreak on` / `off` / `toggle` | Set the mode for this session |
 | `/jailbreak reset` | Drop the session answer, so the config decides again |
-| `/jailbreak remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, and apply it now |
+| `/jailbreak remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, keep the prompt file that model already resolves to, and apply it now |
 
 The footer shows `JailBreak on` while the text is in force, `JailBreak off` while the mode is normal,
 and `JailBreak !` when the mode is jailbreak and the request carried nothing: the prompt file is
